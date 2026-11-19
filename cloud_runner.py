@@ -1,23 +1,19 @@
-"""GitHub Actions 云端执行器: 从 CF KV 领任务 -> vfetch 下载 -> 传 R2 -> 回写链接.
+"""GitHub Actions 云端执行器: 从 CF KV 领任务 -> vfetch 下载 -> 传 GitHub Releases -> 回写下载链接.
 
-所有凭证从环境变量读 (GitHub Secrets), 不落盘、不回显:
-  API_BASE      Worker API 根, 如 https://uniqcard.us.ci/api
-  AGENT_TOKEN   与 Worker secret 同名 (claim/finish/progress 鉴权)
-  R2_ACCOUNT_ID Cloudflare Account ID
-  R2_ACCESS_KEY R2 API Token 的 Access Key ID
-  R2_SECRET_KEY R2 API Token 的 Secret Access Key
-  R2_BUCKET     R2 bucket 名 (如 m3fetch)
-  R2_PUBLIC_BASE bucket 的公开访问域名(尾不带 /), 如 https://pub-xxx.r2.dev
-                 或自定义域 https://files.yourdomain.com
+所有凭证从环境变量读 (GitHub Secrets + Actions 自动注入), 不落盘、不回显:
+  API_BASE           Worker API 根, 如 https://uniqcard.us.ci/api
+  AGENT_TOKEN        与 Worker secret 同名 (claim/finish/progress 鉴权)
+  GITHUB_TOKEN       Actions 自动注入 (需 workflow 声明 contents: write)
+  GITHUB_REPOSITORY  Actions 自动注入, 形如 owner/repo
 
 流程与本机 agent.py 完全兼容: 复用同一套 /api/claim /api/progress /api/finish.
-产物落到临时目录, 上传 R2 用 <id>/<安全文件名> 作 key, finish 时 path = 公开直链.
+产物上传到一个固定 Release (tag: m3fetch-assets), finish 时 path = asset 的公开直链.
+注意: 公开仓库的 Release asset 可被任何人列举/下载, 不具备私密性.
 """
 import os
 import re
 import sys
 import time
-import json
 import subprocess
 import urllib.parse
 
@@ -26,6 +22,7 @@ import requests
 HERE = os.path.dirname(os.path.abspath(__file__))
 VFETCH = os.path.join(HERE, 'vfetch.py')
 PY = sys.executable
+RELEASE_TAG = 'm3fetch-assets'
 
 
 def env(name, required=True):
@@ -37,6 +34,7 @@ def env(name, required=True):
 
 API_BASE = None
 HDR = None
+GH_REPO = None
 
 
 def api(method, path, body=None, timeout=30):
@@ -48,36 +46,65 @@ def api(method, path, body=None, timeout=30):
         raise RuntimeError('API 非 JSON: HTTP %d %s' % (r.status_code, r.text[:200]))
 
 
-def safe_name(name, fallback='media'):
-    """R2 key 用文件名: 去路径/危险字符, 保留中英文与常见符号."""
-    name = str(name or '').strip().replace('\\', '/').split('/')[-1]
-    name = re.sub(r'[<>:"|?*\x00-\x1f]', '', name).strip(' .')
-    return (name or fallback)[:120]
+def gh(method, path, body=None, content_type=None, data=None, timeout=120):
+    """调 GitHub REST / Upload API. token 只从 env 读, 不回显."""
+    tok = env('GITHUB_TOKEN')
+    upload = path.startswith('/upload')
+    host = 'https://uploads.github.com' if upload else 'https://api.github.com'
+    p = path[len('/upload'):] if upload else path
+    url = host + '/repos/' + GH_REPO + p
+    headers = {
+        'Authorization': 'Bearer ' + tok,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    }
+    if content_type:
+        headers['Content-Type'] = content_type
+    kwargs = {'headers': headers, 'timeout': timeout}
+    if data is not None:
+        kwargs['data'] = data
+    else:
+        kwargs['json'] = body
+    r = requests.request(method, url, **kwargs)
+    try:
+        d = r.json()
+    except ValueError:
+        d = {'success': False, 'raw': r.text[:300]}
+    return r.status_code, d
 
 
-def r2_upload(local_path, key):
-    """用 boto3 (S3 兼容) 上传到 R2. 依赖已在 workflow 安装."""
-    import boto3
-    from botocore.config import Config
-    acct = env('R2_ACCOUNT_ID')
-    s3 = boto3.client(
-        's3',
-        endpoint_url='https://%s.r2.cloudflarestorage.com' % acct,
-        aws_access_key_id=env('R2_ACCESS_KEY'),
-        aws_secret_access_key=env('R2_SECRET_KEY'),
-        region_name='auto',
-        config=Config(signature_version='s3v4'),
-    )
-    public_type = 'public-read'  # bucket 需开启公开访问; 若用自定义域则此 ACL 无害
+def gh_ensure_release():
+    """取(或建)固定 release, 返回 release id."""
+    code, d = gh('GET', '/releases/tags/' + urllib.parse.quote(RELEASE_TAG))
+    if code == 200 and d.get('id'):
+        return d['id']
+    code, d = gh('POST', '/releases', {
+        'tag_name': RELEASE_TAG,
+        'name': 'M3Fetch downloads',
+        'body': '自动存放云端下载的文件。请勿手动删除。',
+        'draft': False,
+        'prerelease': False,
+    })
+    if code in (200, 201) and d.get('id'):
+        return d['id']
+    raise RuntimeError('创建 Release 失败: HTTP %d %s' % (code, str(d)[:300]))
+
+
+def gh_upload(release_id, local_path, name):
+    """删同名 asset 再上传(幂等), 返回 browser_download_url."""
+    code, assets = gh('GET', '/releases/%d/assets' % release_id)
+    if code == 200 and isinstance(assets, list):
+        for a in assets:
+            if a.get('name') == name:
+                gh('DELETE', '/releases/assets/%d' % a['id'])
+    url = '/upload/releases/%d/assets?name=%s' % (
+        release_id, urllib.parse.quote(name))
     with open(local_path, 'rb') as f:
-        try:
-            s3.put_object(Bucket=env('R2_BUCKET'), Key=key, Body=f,
-                          ContentType=guess_ct(local_path), ACL=public_type)
-        except Exception:
-            # 某些 R2 配置禁用 ACL, 去掉重试一次
-            f.seek(0)
-            s3.put_object(Bucket=env('R2_BUCKET'), Key=key, Body=f,
-                          ContentType=guess_ct(local_path))
+        code, d = gh('POST', url, content_type=guess_ct(local_path),
+                     data=f, timeout=600)
+    if code in (200, 201) and d.get('browser_download_url'):
+        return d['browser_download_url']
+    raise RuntimeError('上传 asset 失败: HTTP %d %s' % (code, str(d)[:300]))
 
 
 def guess_ct(path):
@@ -88,6 +115,13 @@ def guess_ct(path):
         '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp',
         '.gif': 'image/gif', '.bmp': 'image/bmp',
     }.get(ext, 'application/octet-stream')
+
+
+def safe_name(name, fallback='media'):
+    """Release asset 文件名: 去路径/危险字符, 保留中英文与常见符号."""
+    name = str(name or '').strip().replace('\\', '/').split('/')[-1]
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', '', name).strip(' .')
+    return (name or fallback)[:120]
 
 
 def run_vfetch(task, outdir):
@@ -122,7 +156,7 @@ def run_vfetch(task, outdir):
     return max(files, key=os.path.getmtime)
 
 
-def process(task):
+def process(task, release_id):
     tid = task['id']
     t0 = time.time()
     outdir = os.path.join(HERE, '_tmp', tid)
@@ -138,10 +172,9 @@ def process(task):
         base = safe_name(task.get('name') or os.path.basename(local), tid)
         ext = os.path.splitext(local)[1]
         fname = base if base.lower().endswith(ext) else base + ext
-        key = '%s/%s' % (tid, fname)
-        print('  上传 R2: %s (%.1f MB)' % (key, size / 1048576.0), flush=True)
-        r2_upload(local, key)
-        public = env('R2_PUBLIC_BASE').rstrip('/') + '/' + urllib.parse.quote(key)
+        print('  上传 GitHub Release: %s (%.1f MB)' %
+              (fname, size / 1048576.0), flush=True)
+        public = gh_upload(release_id, local, fname)
         api('POST', '/finish', {'id': tid, 'ok': True, 'path': public,
                                 'size': size, 'secs': round(time.time() - t0, 1)})
         print('  完成 -> %s' % public, flush=True)
@@ -152,7 +185,7 @@ def process(task):
         except Exception as e2:
             print('  回写失败状态也失败: %s' % e2, flush=True)
     finally:
-        # 清理临时产物 (R2 已有副本)
+        # 清理临时产物 (Release 已有副本)
         try:
             import shutil
             shutil.rmtree(outdir, ignore_errors=True)
@@ -161,15 +194,16 @@ def process(task):
 
 
 def main():
-    global API_BASE, HDR
+    global API_BASE, HDR, GH_REPO
     API_BASE = env('API_BASE').rstrip('/')
     HDR = {'X-Agent-Token': env('AGENT_TOKEN')}
-    # 验证凭证齐全 (R2 在真有任务时才用到, 但先检查避免空跑)
-    for k in ('R2_ACCOUNT_ID', 'R2_ACCESS_KEY', 'R2_SECRET_KEY', 'R2_BUCKET', 'R2_PUBLIC_BASE'):
-        env(k)
+    env('GITHUB_TOKEN')
+    GH_REPO = env('GITHUB_REPOSITORY')
+    print('云端执行器启动 (存储: GitHub Releases)', flush=True)
+    release_id = gh_ensure_release()
+    print('Release 就绪: id=%s tag=%s' % (release_id, RELEASE_TAG), flush=True)
     max_jobs = int(os.environ.get('MAX_JOBS', '20'))
     n = 0
-    print('云端执行器启动: 最多处理 %d 个任务' % max_jobs, flush=True)
     while n < max_jobs:
         try:
             d = api('GET', '/claim', timeout=30)
@@ -180,7 +214,7 @@ def main():
         if not d.get('ok') or not d.get('task'):
             print('队列已空, 退出', flush=True)
             break
-        process(d['task'])
+        process(d['task'], release_id)
         n += 1
     print('本次共处理 %d 个任务' % n, flush=True)
 
