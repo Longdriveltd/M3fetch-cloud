@@ -169,9 +169,14 @@ def process(task, release_id):
             pass
         local = run_vfetch(task, outdir)
         size = os.path.getsize(local)
+        # asset 名强制带任务号前缀: 不同任务永不撞名 (GitHub Release asset 名全局唯一,
+        # 同名上传会 422 already_exists; 靠"先删后传"在并发/最终一致性下不可靠).
         base = safe_name(task.get('name') or os.path.basename(local), tid)
         ext = os.path.splitext(local)[1]
-        fname = base if base.lower().endswith(ext) else base + ext
+        base = base[:100]
+        fname = ('%s_%s' % (tid, base))[:120]
+        if not fname.lower().endswith(ext):
+            fname += ext
         print('  上传 GitHub Release: %s (%.1f MB)' %
               (fname, size / 1048576.0), flush=True)
         public = gh_upload(release_id, local, fname)
