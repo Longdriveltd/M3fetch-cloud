@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import threading
 import subprocess
 import urllib.parse
 
@@ -107,6 +108,71 @@ def gh_upload(release_id, local_path, name):
     raise RuntimeError('上传 asset 失败: HTTP %d %s' % (code, str(d)[:300]))
 
 
+def gh_delete_asset(release_id, asset_name):
+    """③ 删除本 Release 下指定名字的 asset. 不存在视为已删(幂等). 返回是否删成功."""
+    code, assets = gh('GET', '/releases/%d/assets' % release_id)
+    if code != 200 or not isinstance(assets, list):
+        raise RuntimeError('列举 asset 失败: HTTP %d' % code)
+    target = None
+    for a in assets:
+        if a.get('name') == asset_name:
+            target = a.get('id')
+            break
+    if target is None:
+        return False  # 本就没有 -> 视为已删
+    code, d = gh('DELETE', '/releases/assets/%d' % target)
+    if code in (200, 204):
+        return True
+    # 404 = 并发下已被删, 同样视为成功
+    if code == 404:
+        return True
+    raise RuntimeError('删 asset 失败: HTTP %d %s' % (code, str(d)[:200]))
+
+
+def asset_name_from_path(raw_path):
+    """从任务 path(Release 直链)解析 asset 文件名; 非 http 返回 None(本机任务, 云端不处理)."""
+    if not raw_path or not isinstance(raw_path, str):
+        return None
+    if not raw_path.lower().startswith(('http://', 'https://')):
+        return None
+    name = urllib.parse.unquote(urllib.parse.urlparse(raw_path).path.rstrip('/').split('/')[-1])
+    # 目录穿越/非法名守卫: 只接受纯文件名
+    if not name or '/' in name or '\\' in name or name.startswith('..'):
+        return None
+    return name
+
+
+def process_deletes(release_id):
+    """③ 消费删除队列中属于云端的任务: 删 Release asset + 回写 scope=cloud.
+    本机任务(path 非 http)跳过, 由本机 agent 独立处理. 返回本次处理条数."""
+    try:
+        d = api('GET', '/deletes')
+    except Exception as e:
+        print('  ③ 查询删除队列失败: %s' % e, flush=True)
+        return 0
+    items = d.get('items') or []
+    done = 0
+    for it in items:
+        jid = str(it.get('id') or '')
+        raw_path = it.get('path') or ''
+        name = asset_name_from_path(raw_path)
+        if not name:
+            continue  # 本机任务或非法路径, 交给本机 agent
+        try:
+            removed = gh_delete_asset(release_id, name)
+            ok, err = True, ''
+            print('  ③ 删云端 asset %s: %s' % (name, '已删' if removed else '本就不存在'), flush=True)
+        except Exception as e:
+            ok, err = False, str(e)[:200]
+            print('  ③ 删云端 asset %s 失败: %s' % (name, err), flush=True)
+        try:
+            api('POST', '/delete-done', {'id': jid, 'ok': ok, 'err': err, 'scope': 'cloud'})
+            done += 1
+        except Exception as e:
+            print('  ③ 删除结果回写失败: %s' % e, flush=True)
+    return done
+
+
 def guess_ct(path):
     ext = os.path.splitext(path)[1].lower()
     return {
@@ -122,6 +188,16 @@ def safe_name(name, fallback='media'):
     name = str(name or '').strip().replace('\\', '/').split('/')[-1]
     name = re.sub(r'[<>:"|?*\x00-\x1f]', '', name).strip(' .')
     return (name or fallback)[:120]
+
+
+def _heartbeat(tid, stop_evt):
+    """② 下载期间每 60s 上报一次, 刷新 Worker 租约, 防止被卡死回收误杀.
+    只带 phase 文字续租, 不伪造百分比(真实进度属另一议题). 失败静默, 不打断下载."""
+    while not stop_evt.wait(60):
+        try:
+            api('POST', '/progress', {'id': tid, 'phase': '云端下载中…'})
+        except Exception:
+            pass
 
 
 def run_vfetch(task, outdir):
@@ -161,12 +237,15 @@ def process(task, release_id):
     t0 = time.time()
     outdir = os.path.join(HERE, '_tmp', tid)
     os.makedirs(outdir, exist_ok=True)
+    stop_evt = threading.Event()
+    hb = threading.Thread(target=_heartbeat, args=(tid, stop_evt), daemon=True)
     try:
         print('领取任务 %s: %s [%s]' % (tid, task['url'], task.get('fmt')), flush=True)
         try:
             api('POST', '/progress', {'id': tid, 'phase': '云端解析中…'})
         except Exception:
             pass
+        hb.start()  # ② 下载期间续租, 防大文件被卡死回收误杀
         local = run_vfetch(task, outdir)
         size = os.path.getsize(local)
         # asset 名强制带任务号前缀: 不同任务永不撞名 (GitHub Release asset 名全局唯一,
@@ -194,6 +273,7 @@ def process(task, release_id):
         except Exception as e2:
             print('  回写失败状态也失败: %s' % e2, flush=True)
     finally:
+        stop_evt.set()  # ② 下载结束(成功/失败)停心跳, 避免覆盖终态
         # 清理临时产物 (Release 已有副本)
         try:
             import shutil
@@ -211,6 +291,12 @@ def main():
     print('云端执行器启动 (存储: GitHub Releases)', flush=True)
     release_id = gh_ensure_release()
     print('Release 就绪: id=%s tag=%s' % (release_id, RELEASE_TAG), flush=True)
+    # ③ 先处理删除队列(云端 asset 清理), 与下载任务无关, 独立跑一次
+    try:
+        nd = process_deletes(release_id)
+        print('③ 本轮清理云端 asset %d 项' % nd, flush=True)
+    except Exception as e:
+        print('③ 删除队列处理异常(不影响下载): %s' % e, flush=True)
     max_jobs = int(os.environ.get('MAX_JOBS', '20'))
     n = 0
     while n < max_jobs:
@@ -228,5 +314,58 @@ def main():
     print('本次共处理 %d 个任务' % n, flush=True)
 
 
+def self_test():
+    """无需网络的纯逻辑自测: asset 名解析 + 双确认出队判定(与 Worker 同规则)."""
+    tests = []
+
+    # 正控: https 直链能解析出 asset 名(带任务号前缀, 与上传 fname 一致)
+    u = 'https://github.com/Longdriveltd/M3fetch-cloud/releases/download/m3fetch-assets/mwn5ivougp8co_.mp4'
+    tests.append(('正控-解析asset名', asset_name_from_path(u) == 'mwn5ivougp8co_.mp4'))
+    # 含 URL 编码的中文名
+    u2 = 'https://github.com/o/r/releases/download/tag/abc_%E4%B8%AD%E6%96%87.mp4'
+    tests.append(('正控-URL解码', asset_name_from_path(u2) == 'abc_中文.mp4'))
+    # 负控: 本机路径 / 空值 / 目录穿越 必须 None(云端不处理)
+    tests.append(('负控-本机路径', asset_name_from_path('C:\\M3fectch\\x.mp4') is None))
+    tests.append(('负控-空值', asset_name_from_path('') is None))
+    tests.append(('负控-目录穿越', asset_name_from_path(
+        'https://x/y/download/tag/..%2F..%2Fevil.mp4') is None))
+
+    # 双确认出队判定(镜像 Worker delete-done 的规则)
+    def all_done(item, who, ok):
+        field = 'cloud_done' if who == 'cloud' else 'local_done'
+        err = ''
+        gone = bool(ok) or bool(__import__('re').search(r'404|不存在|not found', err, __import__('re').I))
+        if not gone:
+            return False
+        it = dict(item)
+        if 'local_done' not in it: it['local_done'] = False
+        if 'cloud_done' not in it:
+            it['cloud_done'] = not str(it.get('path', '')).lower().startswith(('http://', 'https://'))
+        it[field] = True
+        return bool(it['local_done'] and it['cloud_done'])
+
+    cloud_item = {'id': 't1', 'path': u}
+    local_item = {'id': 't2', 'path': '/data/M3fectch/x.mp4'}
+    # 云端任务: 单方都不够, 双方都到齐才出队
+    tests.append(('双确认-云端仅local', all_done(cloud_item, 'local', True) is False))
+    tests.append(('双确认-云端仅cloud', all_done(cloud_item, 'cloud', True) is False))
+    tests.append(('双确认-云端双方', all_done(
+        {'id': 't1', 'path': u, 'local_done': True, 'cloud_done': False},
+        'cloud', True) is True))
+    # 本机任务: cloud_done 初始即真, 本机确认即出队
+    tests.append(('双确认-本机local即出队', all_done(local_item, 'local', True) is True))
+    # 失败不确认
+    tests.append(('双确认-失败不打勾', all_done(cloud_item, 'cloud', False) is False))
+
+    ok_n = sum(1 for _, r in tests if r)
+    for name, r in tests:
+        print('  [%s] %s' % ('PASS' if r else 'FAIL', name))
+    print('self-test %d/%d' % (ok_n, len(tests)))
+    return 0 if ok_n == len(tests) else 1
+
+
 if __name__ == '__main__':
+    import sys
+    if '--self-test' in sys.argv:
+        raise SystemExit(self_test())
     main()
