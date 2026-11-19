@@ -173,8 +173,12 @@ def process(task, release_id):
         # 同名上传会 422 already_exists; 靠"先删后传"在并发/最终一致性下不可靠).
         base = safe_name(task.get('name') or os.path.basename(local), tid)
         ext = os.path.splitext(local)[1]
+        # vfetch 对无标题链接会产出 default 占位名, 这种不算有效 basename
+        if base.lower() in ('default', 'output', 'video', 'media') or base == tid:
+            base = ''
         base = base[:100]
-        fname = ('%s_%s' % (tid, base))[:120]
+        # asset 名以任务号开头(保证唯一), 有有效标题再拼上去
+        fname = (('%s_%s' % (tid, base)) if base else tid)[:120]
         if not fname.lower().endswith(ext):
             fname += ext
         print('  上传 GitHub Release: %s (%.1f MB)' %
