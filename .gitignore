@@ -2,3 +2,8 @@ __pycache__/
 _tmp/
 _probe_out/
 *.pyc
+.secrets.enc
+.cf_token.enc
+*.enc
+*.key
+.env
