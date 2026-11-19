@@ -64,8 +64,9 @@ def main():
         print('结论: 部分站点可下, 需针对失败站点加策略或代理', flush=True)
     else:
         print('结论: 机房 IP 被封, 此方案不可行, 需换方案', flush=True)
-    return 0
+    # 全成功返回 0, 否则非 0 -> Actions 状态直接反映真实结果, 不必翻日志
+    return 0 if ok == len(TESTS) else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
