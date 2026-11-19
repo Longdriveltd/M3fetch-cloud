@@ -1,0 +1,22 @@
+name: M3Fetch Probe (零凭证下载测试)
+
+# 用途: 验证 GitHub Actions 机房 IP 能否下载常见站点.
+# 不需要任何 secret. 建好仓库后手动触发, 看日志结论.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -q requests yt-dlp imageio-ffmpeg
+      - name: Run probe
+        run: python probe.py
