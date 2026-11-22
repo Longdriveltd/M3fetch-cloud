@@ -46,6 +46,31 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ---------------------------------------------------------------- 代理与 DNS
+# 强制直连(不走系统/环境代理):
+#   2026-11-22 实测 —— 本机 HTTP_PROXY/HTTPS_PROXY 指向 127.0.0.1:55451
+#   (WorkBuddy 注入) 与注册表代理 127.0.0.1:10808 (v2rayN), 两者对微信域名
+#   均返回 502 / TLS 中断, 表现为 yt-dlp "SSL: UNEXPECTED_EOF_WHILE_READING",
+#   而同一 URL 直连 HTTP 200 正常. urllib 默认会读 env+注册表代理 => 必须显式
+#   建一个"无代理"的 opener 并全局替换 urlopen, 否则所有解析/下载都会踩代理.
+#   与 agent.py 的 _SESSION.trust_env=False 保持一致.
+# DNS 兜底: 系统解析器对 *.us.ci 间歇 SERVFAIL (阿里 DNS), 失败时自动改用备份 DNS.
+try:
+    import dnsfix
+    dnsfix.install()
+except Exception:
+    pass
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req, timeout=None):
+    """全局无代理 urlopen (替代 urllib.request.urlopen)."""
+    return _OPENER.open(req, timeout=timeout)
+
+
+urllib.request.urlopen = _urlopen
+
 if sys.platform == 'win32':
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -576,7 +601,11 @@ def resolve_ytdlp(url, timeout, extra_cands=None):
     except ImportError:
         return [], 'yt-dlp 未安装 (可选依赖)'
     opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
-            'noplaylist': True, 'socket_timeout': timeout}
+            'noplaylist': True, 'socket_timeout': timeout,
+            # 禁用代理: yt-dlp 默认读 HTTP_PROXY/HTTPS_PROXY, 本机代理对目标站
+            # 502/TLS 中断, 表现为 "SSL: UNEXPECTED_EOF_WHILE_READING".
+            # 'proxy': '' 表示不走任何代理 (直连).
+            'proxy': ''}
     cands = list(dict.fromkeys([url] + list(extra_cands or [])))
     info = None
     last_err = ''
