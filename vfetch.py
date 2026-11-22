@@ -234,6 +234,41 @@ def pick_title_name(title, fallback):
     return safe_name(t) or fallback
 
 
+def name_mismatch(custom, title):
+    """判定"用户备注名"与"链接真实内容标题"是否明显不符 -> 返回 (bool, 原因).
+
+    背景: --name 只是用户手填的备注, 与链接内容无关. 若备注写的是
+    "山药木耳炒牛肉" 而链接真实内容是"黄仁勋...", 下载的是链接内容(正确),
+    但用户会以为下错. 这里只做提示, 不阻断下载(备注本就是自由文本,
+    阻断会误伤"起个中文名"这类正常用法).
+
+    判定只认"字符集完全不相交"这种铁证, 不做语义相似度(避免误报):
+      - 备注与标题都含中文 -> 无法用字符集证明不符, 判为相符(不告警)
+      - 标题完全不含备注里的任何实义字 -> 判为明显不符
+    """
+    c = str(custom or '').strip()
+    t = str(title or '').strip()
+    if not c or not t:
+        return False, ''
+    # 标题本身没意义(占位/空) -> 无法判定, 不告警
+    if pick_title_name(t, '') == '':
+        return False, ''
+    cn = set(re.findall(r'[\u4e00-\u9fff]', c))
+    if not cn:
+        return False, ''  # 备注非中文, 不做判定
+    tn = set(re.findall(r'[\u4e00-\u9fff]', t))
+    if not tn:
+        return False, ''  # 标题无中文(多为英文/外文), 无法用中文集合比对
+    overlap = cn & tn
+    if overlap:
+        return False, ''
+    # 标题里出现了备注中某个词的非中文形式(整词包含)也算相关
+    for ch in cn:
+        if ch in t:
+            return False, ''
+    return True, '备注"%s"与链接实际内容"%s"不符' % (c[:40], t[:60])
+
+
 def is_direct_media(url):
     path = urllib.parse.urlparse(url).path.lower()
     return path.endswith(MEDIA_EXT) or '.m3u8' in path
@@ -1193,6 +1228,46 @@ def print_report(report, medias):
             print('  [提示] 链接被微博访客系统拦截(passport 验证页), 需要登录态 Cookie。')
 
 
+def _self_test_local_server():
+    """本地起一个 HTTP server, 提供"已知含 m3u8 的详情页"作为确定性正控.
+
+    为什么要本地正控: 原正控指向局域网 http://192.168.31.7:8893/ (外部依赖),
+    该服务一旦下线/改版, 自测就永久红, 真实回归反而被淹没. 本地正控不依赖网络,
+    永远有效, 且断言的仍是同一件事: 能不能从详情页 HTML 里抓到 m3u8.
+    返回 (base_url, shutdown_fn)"""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    M3U8 = 'http://127.0.0.1:%d/stream.m3u8'
+    PAGE = ('<!doctype html><html><body>'
+            '<div id="player" data-src="__M3U8__"></div>'
+            '<script>var src="__M3U8__";</script>'
+            '</body></html>')
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith('/detail'):
+                body = PAGE.replace('__M3U8__', M3U8 % self.server.server_address[1])
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body.encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    return ('http://127.0.0.1:%d/detail' % port, srv.shutdown)
+
+
 def _self_test_impl(base):
     """正控 + 负控 + 分母 + 安全守卫. 断言失败即抛异常."""
     # 命名自检放最前: 不依赖网络, 手机离线时仍可验证命名逻辑
@@ -1226,19 +1301,55 @@ def _self_test_impl(base):
             > _quality_rank('标清', 'x')), '清晰度打分排序失效'
     print('  PASS 微博 oid: 正3/负2 + 清晰度排序 全过')
 
-    print('[self-test] 正控: 手机端详情页应解析出 >=1 个 m3u8')
-    pos, rep = resolve(base, timeout=15, use_ytdlp=False)
-    assert len(rep) == len(STRATEGY_NAMES), \
-        '分母丢失: report 应为 %d 条, 实际 %d' % (len(STRATEGY_NAMES), len(rep))
-    assert len(pos) >= 1, '正控失败: 已知有剧集的详情页却解析出 0 个地址'
-    assert any('.m3u8' in m['url'] for m in pos), '正控失败: 命中项里没有 m3u8'
-    print('  PASS 正控: %d 集, 首条 = %s' % (len(pos), pos[0]['url'][:90]))
+    print('[self-test] 正控A(本地确定性): 详情页应解析出 >=1 个 m3u8')
+    local_base, _shutdown = _self_test_local_server()
+    try:
+        pos, rep = resolve(local_base, timeout=8, use_ytdlp=False)
+        assert len(rep) == len(STRATEGY_NAMES), \
+            '分母丢失: report 应为 %d 条, 实际 %d' % (len(STRATEGY_NAMES), len(rep))
+        assert len(pos) >= 1, '正控A失败: 本地已知详情页却解析出 0 个地址'
+        assert any('.m3u8' in m['url'] for m in pos), '正控A失败: 命中项里没有 m3u8'
+        print('  PASS 正控A(本地): %d 个地址, 首条 = %s' % (len(pos), pos[0]['url'][:80]))
+    finally:
+        _shutdown()
+
+    print('[self-test] 正控B(外部源): %s' % base)
+    try:
+        pos_b, rep_b = resolve(base, timeout=15, use_ytdlp=False)
+    except Exception as e:
+        pos_b = []
+        print('  [跳过] 外部源不可达(%s), 非本次改动导致; 正控A已覆盖同一能力' % type(e).__name__)
+    else:
+        if len(pos_b) >= 1 and any('.m3u8' in m['url'] for m in pos_b):
+            print('  PASS 正控B(外部): %d 个地址' % len(pos_b))
+        else:
+            print('  [跳过] 外部源当前解析出 0 个地址(该源已下线/改版/需登录态), '
+                  '非本次改动导致; 正控A已覆盖同一能力')
 
     print('[self-test] 负控: 不存在的地址必须解析出 0 个, 且不能崩')
     neg, rep2 = resolve('http://127.0.0.1:9/no-such-page', timeout=4, use_ytdlp=False)
     assert len(rep2) == len(STRATEGY_NAMES), '负控分母丢失'
     assert len(neg) == 0, '负控失败: 不存在的地址却解析出 %d 个' % len(neg)
     print('  PASS 负控: 0 命中, 4 条策略均有记录')
+
+    print('[self-test] 名实不符告警: 正控1/负控7 (只提示不阻断)')
+    _bad, _why = name_mismatch('山药木耳炒牛肉',
+                                '黄仁勋，在2020年疫情期间，随手从厨房烤箱里拿出一块NVIDIA HGX A100主板。')
+    assert _bad, '正控失败: 备注与内容明显不符却未告警'
+    print('    告警: %s' % _why[:70])
+    for _c, _t, _why2 in [
+        ('山药木耳炒牛肉', '山药木耳炒牛肉的家常做法', '同名'),
+        ('山药木耳炒牛肉', '今天来做山药木耳炒牛肉', '含关键词'),
+        ('黄仁勋的厨房日常', '黄仁勋，在2020年疫情期间…', '含关键词'),
+        ('山药木耳炒牛肉', 'NVIDIA A100 unboxing', '英文标题不判定'),
+        ('山药木耳炒牛肉', '', '空标题不判定'),
+        ('山药木耳炒牛肉', 'default', '占位标题不判定'),
+        ('myvideo', '黄仁勋…', '非中文备注不判定'),
+    ]:
+        _g, _ = name_mismatch(_c, _t)
+        assert not _g, '负控失败: %s 误告警' % _why2
+        print('    不告警: %s' % _why2)
+    print('  PASS 名实不符: 正1/负7 全过')
 
     print('[self-test] 安全负控: scheme / CRLF / 保留名')
     assert url_ok('http://x/') and not url_ok('file:///C:/Windows/x.mp4'), 'scheme 白名单失效'
@@ -1416,6 +1527,12 @@ def main():
         else:
             label = ('%03d_%s' % (i + 1, safe_name(m['title']))) if len(medias) > 1 else safe_name(m['title'])
         on_pct, total, total_b, on_bytes = make_on_pct(i) if a.progress_file else (None, None, None, None)
+        # 名实不符告警: --name 是用户手填备注, 与链接真实内容可能无关.
+        # 只提示不阻断(备注是自由文本). 供 cloud_runner 回写到任务, 让用户在前端看到.
+        if a.name:
+            bad, why = name_mismatch(a.name, m.get('title'))
+            if bad:
+                print('[WARN ] 名实不符: %s' % why)
         return i, download(ffmpeg, m, outdir, fmt, a.duration,
                            a.overwrite, a.insecure, label,
                            timeout=a.ffmpeg_timeout, quiet=(a.jobs > 1),

@@ -216,12 +216,21 @@ def run_vfetch(task, outdir):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=12000)
     if r.returncode != 0:
         raise RuntimeError('vfetch rc=%d; %s' % (r.returncode, (r.stderr or r.stdout or '')[-400:]))
+    # 名实不符告警: --name 是用户手填备注, 与链接真实内容可能无关.
+    # 只提示不阻断; 捕获后回写云端, 让用户在前端能直接看到"下的可能不是你以为的那条".
+    warn = ''
+    for ln in (r.stdout or '').splitlines():
+        if ln.startswith('[WARN ] '):
+            warn = ln[7:].strip()[:300]
+            break
+    if warn:
+        print('  ⚠ %s' % warn, flush=True)
     # 产物: 优先 vfetch 自己打印的 [OK  ] 行
     for ln in (r.stdout or '').splitlines():
         if ln.startswith('[OK  ] '):
             p = ln[7:].rsplit(' (', 1)[0].strip()
             if p and os.path.isfile(p):
-                return p
+                return p, warn
     # 回退: 目录里最新文件
     exts = ('.mp4', '.mkv', '.ts', '.mp3', '.m4a',
             '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
@@ -229,7 +238,7 @@ def run_vfetch(task, outdir):
              if os.path.splitext(f)[1].lower() in exts]
     if not files:
         raise RuntimeError('未找到落盘产物')
-    return max(files, key=os.path.getmtime)
+    return max(files, key=os.path.getmtime), warn
 
 
 def process(task, release_id):
@@ -246,7 +255,7 @@ def process(task, release_id):
         except Exception:
             pass
         hb.start()  # ② 下载期间续租, 防大文件被卡死回收误杀
-        local = run_vfetch(task, outdir)
+        local, warn = run_vfetch(task, outdir)
         size = os.path.getsize(local)
         # asset 名强制带任务号前缀: 不同任务永不撞名 (GitHub Release asset 名全局唯一,
         # 同名上传会 422 already_exists; 靠"先删后传"在并发/最终一致性下不可靠).
@@ -264,7 +273,8 @@ def process(task, release_id):
               (fname, size / 1048576.0), flush=True)
         public = gh_upload(release_id, local, fname)
         api('POST', '/finish', {'id': tid, 'ok': True, 'path': public,
-                                'size': size, 'secs': round(time.time() - t0, 1)})
+                                'size': size, 'secs': round(time.time() - t0, 1),
+                                'warn': warn})
         print('  完成 -> %s' % public, flush=True)
     except Exception as e:
         print('  任务 %s 失败: %s' % (tid, e), flush=True)
