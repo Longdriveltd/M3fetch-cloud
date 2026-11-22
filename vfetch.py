@@ -87,7 +87,7 @@ MOBILE_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) '
 MEDIA_EXT = ('.m3u8', '.mp4', '.mkv', '.ts', '.mp3', '.flv', '.mov', '.webm', '.m4a')
 IMG_EXT = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
 STRATEGY_NAMES = ['1 直链判断', '2 手机端详情 API', '3 网页嗅探',
-                  '4 微博视频页 API', '5 yt-dlp 兜底']
+                  '4 微信视频号 API', '5 微博视频页 API', '6 yt-dlp 兜底']
 ALLOWED_SCHEMES = ('http', 'https')
 MAX_HTTP_BYTES = 8 * 1024 * 1024
 MAX_IMG_BYTES = 50 * 1024 * 1024
@@ -301,7 +301,12 @@ def is_direct_media(url):
 
 def is_image(url):
     path = urllib.parse.urlparse(url).path.lower()
-    return path.endswith(IMG_EXT)
+    if path.endswith(IMG_EXT):
+        return True
+    # 视频号封面是 CDN 直链, 无扩展名, 但路径段 20304 + 图片格式参数 => 实为图片.
+    # (视频流走 20302/20303, 不含 picformat, 不会被误判)
+    q = urllib.parse.urlparse(url).query.lower()
+    return ('/20304/' in path and ('wxampicformat=' in q or 'picformat=' in q))
 
 
 def img_ext(url):
@@ -666,6 +671,154 @@ def resolve_ytdlp(url, timeout, extra_cands=None):
     return out, 'yt-dlp 返回 %d 项' % len(out)
 
 
+# ---------------------------------------------------------------- 微信视频号
+# 视频号 (channels.weixin.qq.com) 的 sph 分享链接是纯 JS 空壳:
+#   weixin.qq.com/sph/<shortUri> -> 301 -> channels.weixin.qq.com/finder-preview/pages/sph?id=<shortUri>
+# 页面 HTML 里没有任何 m3u8/mp4 (实测 2601 字符, 0 命中), 必须走官方前端接口:
+#   POST https://channels.weixin.qq.com/finder-preview/api/feed/get_feed_info
+#   body: {"baseReq":{"generalToken":""}, "shortUri":"<shortUri>"}
+# 匿名可拿: 作者昵称 / 文案 / 封面 coverUrl / dynamicExportId
+# 视频流本体需要 generalToken (腾讯元宝 Web Cookie 换取), 匿名拿不到视频直链;
+# 若用户提供元宝 Cookie, 则走 yuanbao 解析链换 token + exportId, 再取媒体直链.
+WX_SPH_HOSTS = ('weixin.qq.com', 'channels.weixin.qq.com')
+WX_FEED_INFO_API = 'https://channels.weixin.qq.com/finder-preview/api/feed/get_feed_info'
+WX_YUANBAO_API = 'https://yuanbao.tencent.com/api/weixin/get_parse_result'
+WX_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 '
+         '(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1 MicroMessenger/8.0.40')
+
+
+def weixin_sph_id(url):
+    """从视频号链接里取出 shortUri; 非视频号链接返回 None.
+
+    形如 weixin.qq.com/sph/AK3C9Lvlga 或 .../finder-preview/pages/sph?id=AK3C9Lvlga"""
+    p = urllib.parse.urlparse(url)
+    host = (p.hostname or '').lower()
+    if host not in WX_SPH_HOSTS:
+        return None
+    path = p.path or ''
+    if '/sph/' in path:
+        sid = path.rsplit('/sph/', 1)[1].strip('/')
+        return sid or None
+    q = urllib.parse.parse_qs(p.query)
+    sid = (q.get('id') or q.get('shortUri') or [''])[0].strip()
+    return sid or None
+
+
+def _wx_post_json(api, body, timeout, headers=None):
+    """POST JSON 到视频号/元宝接口 (强制直连, 走 _OPENER 无代理)."""
+    h = {'User-Agent': WX_UA, 'Content-Type': 'application/json',
+         'Accept': 'application/json, text/plain, */*',
+         'Origin': 'https://channels.weixin.qq.com',
+         'Referer': 'https://channels.weixin.qq.com/finder-preview/pages/sph',
+         'Accept-Encoding': 'identity'}
+    if headers:
+        h.update(norm_headers(headers))
+    req = urllib.request.Request(api, data=json.dumps(body).encode('utf-8'), headers=h,
+                                 method='POST')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(4 * 1024 * 1024)
+    return json.loads(raw.decode('utf-8', 'replace'))
+
+
+def resolve_weixin_channels(url, timeout=20, extra_headers=None):
+    """解析微信视频号 sph 链接 -> (medias, note).
+
+    匿名: 返回封面图直链 (picInfo 为空时用 coverUrl) + 文案, 并在 note 里说明
+    视频流需元宝 Cookie. 有 Cookie: 走 yuanbao 换 token/exportId, 再取视频直链.
+    """
+    sid = weixin_sph_id(url)
+    if not sid:
+        return [], '不是视频号链接'
+    try:
+        d = _wx_post_json(WX_FEED_INFO_API,
+                           {'baseReq': {'generalToken': ''}, 'shortUri': sid},
+                           timeout)
+    except Exception as e:
+        return [], '视频号接口失败: %s' % str(e)[:120]
+    data = d.get('data') or {}
+    fi = data.get('feedInfo') or {}
+    author = (data.get('authorInfo') or {}).get('nickname') or ''
+    desc = fi.get('description') or ''
+    scene = data.get('sceneInfo') or {}
+    title = (desc or '视频号视频')[:60]
+    if author:
+        title = '%s-%s' % (author, title)
+
+    # 有元宝 Cookie -> 换 generalToken + exportId, 拿视频直链
+    cookie = ''
+    for k, v in norm_headers(extra_headers).items():
+        if k.lower() == 'cookie':
+            cookie = v
+    if cookie:
+        try:
+            yb = _wx_post_json(
+                WX_YUANBAO_API,
+                {'type': 'video_channel_url', 'url': url, 'scene': 1},
+                timeout,
+                {'Cookie': cookie, 'Origin': 'https://yuanbao.tencent.com',
+                 'Referer': 'https://yuanbao.tencent.com/'})
+            export_id = (yb.get('wx_export_id') or yb.get('exportId') or '')
+            token = (yb.get('generalToken') or yb.get('token') or '')
+            playable = yb.get('playable_url') or ''
+            if playable:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(playable).query)
+                token = token or (q.get('token') or [''])[0]
+                export_id = export_id or (q.get('eid') or q.get('exportId') or [''])[0]
+            if export_id:
+                d2 = _wx_post_json(
+                    WX_FEED_INFO_API,
+                    {'baseReq': {'generalToken': token}, 'exportId': export_id},
+                    timeout)
+                meds = _wx_media_from_feed(d2, title, extra_headers)
+                if meds:
+                    return meds, '视频号(元宝 token) 命中 %d 项' % len(meds)
+        except Exception as e:
+            return [], '视频号取流失败(元宝链路): %s' % str(e)[:120]
+
+    # 匿名兜底: 只拿到元数据 + 封面. 不把封面当"视频"返回 —— 那会让任务假成功
+    # (落盘一个 jpg 却报下载完成). 明确告知缺什么, 由上层把错误写进任务状态.
+    cover = fi.get('coverUrl') or ''
+    note = '视频号视频流匿名不可得(需腾讯元宝 Cookie 换 generalToken)'
+    if desc:
+        note += ' | 文案: %s' % desc[:60]
+    if author:
+        note += ' | 作者: %s' % author[:30]
+    if cover:
+        note += ' | 封面: %s' % cover[:80]
+    return [], note
+
+
+def _wx_media_from_feed(feed, title, extra_headers):
+    """从带媒体的 get_feed_info 响应里提取视频/图片直链."""
+    out = []
+    fi = (feed.get('data') or {}).get('feedInfo') or {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = str(k).lower()
+                if isinstance(v, str) and v.startswith('http'):
+                    if '.mp4' in v or '.m3u8' in v:
+                        out.append(v)
+                elif kl in ('url', 'urlinfo', 'videourl', 'mediainfo'):
+                    walk(v)
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(fi)
+    seen, medias = set(), []
+    for u in out:
+        if u in seen:
+            continue
+        seen.add(u)
+        medias.append({'title': title, 'url': u, 'headers': norm_headers(extra_headers),
+                       'channel': '视频号', 'via': 'weixin-channels'})
+    return medias
+
+
 def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
     """返回 (medias, report). report 条数 == STRATEGY_NAMES -> 分母强制."""
     report = [{'name': n, 'count': 0, 'note': ''} for n in STRATEGY_NAMES]
@@ -730,7 +883,22 @@ def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
         else:
             report[2]['note'] = '策略 2 已命中, 未执行'
 
-    # 策略 4: 微博视频页 API (h5 播放页是 JS 空壳, 嗅探扫不到, 必须走组件 API)
+    # 策略 4: 微信视频号 API (sph 分享页是纯 JS 空壳, 嗅探扫不到)
+    if not medias:
+        if weixin_sph_id(url) or weixin_sph_id(final_url):
+            try:
+                m, note = resolve_weixin_channels(url, timeout, extra)
+            except Exception as e:
+                m, note = [], '视频号 API 失败: %s' % str(e)[:120]
+            medias.extend(m)
+            report[3]['count'] = len(m)
+            report[3]['note'] = note
+        else:
+            report[3]['note'] = '不是视频号链接'
+    else:
+        report[3]['note'] = '前面策略已命中, 未执行'
+
+    # 策略 5: 微博视频页 API (h5 播放页是 JS 空壳, 嗅探扫不到, 必须走组件 API)
     if not medias:
         tried = []
         note = ''
@@ -745,26 +913,26 @@ def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
             if m:
                 medias.extend(m)
                 break
-        report[3]['count'] = len(medias)
+        report[4]['count'] = len(medias)
         if tried:
-            report[3]['note'] = note + ' (试了 %d 个地址)' % len(tried)
+            report[4]['note'] = note + ' (试了 %d 个地址)' % len(tried)
         else:
-            report[3]['note'] = '不是微博视频页 (无 oid)'
+            report[4]['note'] = '不是微博视频页 (无 oid)'
     else:
-        report[3]['note'] = '前面策略已命中, 未执行'
+        report[4]['note'] = '前面策略已命中, 未执行'
 
-    # 策略 5: yt-dlp 兜底 (先解短链/中间页, 再逐个候选尝试)
+    # 策略 6: yt-dlp 兜底 (先解短链/中间页, 再逐个候选尝试)
     if not medias:
         if use_ytdlp:
             cands = unwrap_candidates(url, timeout)
             m, note = resolve_ytdlp(url, timeout, extra_cands=cands)
             medias.extend(m)
-            report[4]['count'] = len(m)
-            report[4]['note'] = note + (' | 解包候选 %d 个' % len(cands) if len(cands) > 1 else '')
+            report[5]['count'] = len(m)
+            report[5]['note'] = note + (' | 解包候选 %d 个' % len(cands) if len(cands) > 1 else '')
         else:
-            report[4]['note'] = '已用 --no-ytdlp 关闭'
+            report[5]['note'] = '已用 --no-ytdlp 关闭'
     else:
-        report[4]['note'] = '前面策略已命中, 未执行'
+        report[5]['note'] = '前面策略已命中, 未执行'
 
     for m in medias:
         h = norm_headers(m.get('headers'))
@@ -1255,6 +1423,10 @@ def print_report(report, medias):
         hint = '; '.join(r['note'] for r in report if 'passport' in str(r.get('note', '')))
         if hint:
             print('  [提示] 链接被微博访客系统拦截(passport 验证页), 需要登录态 Cookie。')
+        # 视频号: 明确告诉用户缺什么, 别只说"未找到"
+        for r in report:
+            if '视频号' in str(r.get('name', '')) and r.get('note'):
+                print('  [提示] %s' % r['note'])
 
 
 def _self_test_local_server():
