@@ -20,6 +20,13 @@ import urllib.parse
 
 import requests
 
+# DNS 兜底: 避免本地/云端 DNS 抖动导致解析 *.us.ci 失败
+try:
+    import dnsfix
+    dnsfix.install()
+except Exception:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 VFETCH = os.path.join(HERE, 'vfetch.py')
 PY = sys.executable
