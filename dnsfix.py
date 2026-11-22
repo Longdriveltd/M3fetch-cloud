@@ -22,12 +22,32 @@ import threading
 #   119.29.29.29 (腾讯 DNSPod) 12/12  8.8.8.8 12/12  114.114.114.114 12/12
 #   1.1.1.1            仅 9/12 (超时偏多) -> 放最后
 #   223.5.5.5 (阿里)    对 *.us.ci 间歇 SERVFAIL -> 不作为兜底
+#
+# ⚠️ 污染问题 (2026-11-22 实测): 国内 DNS 会对 github.com 返回污染 IP
+#   (57.155.223.240 / 57.155.223.241), 8.8.8.8 对 codeload.github.com 也污染.
+#   被污染的 IP 时通时不通, 靠连通性判断不可靠 -> 用"域名可信网段"白名单校验,
+#   命中白名单则该结果直接丢弃并换下一个 DNS.
 FALLBACK_DNS = (
     '119.29.29.29',
     '114.114.114.114',
     '8.8.8.8',
     '1.1.1.1',
 )
+
+# 域名 -> 可信 IP 网段. 只列实测确认的官方网段 (GitHub/Azure/Cloudflare).
+# 命中黑名单外的可疑段 => 视为污染, 换 DNS 重查.
+_TRUSTED_NETS = {
+    # GitHub 主站实测网段 (20.x / 140.82.x); 20.6/20.172/20.205/20.247 均出现过
+    'github.com': ('20.', '140.82.'),
+    'githubusercontent.com': ('185.199.',),
+    'githubassets.com': ('185.199.',),
+    'github.io': ('185.199.',),
+    'githubapp.com': ('140.82.', '20.'),
+    'githubusercontent.net': ('185.199.',),
+}
+# 已知污染段 (57.155.223.240-241 等) —— 显式拉黑, 避免误信
+_BLOCKED_PREFIX = ('57.155.223.',)
+
 QUERY_TIMEOUT = 3.0
 TTL_SEC = 300
 
@@ -103,8 +123,103 @@ def _query_dns(server, name, timeout=QUERY_TIMEOUT):
             pass
 
 
+def _ip_suspicious(host, ip):
+    """判断该 IP 是否像是 DNS 污染结果.
+
+    判据 (2026-11-22 实测):
+      1. 显式黑名单段 (57.155.223.* 实测被污染)
+      2. 域名有已知可信网段时, 结果不在白名单 => 不可信
+    """
+    if not ip:
+        return True
+    for bad in _BLOCKED_PREFIX:
+        if ip.startswith(bad):
+            return True
+    h = (host or '').lower()
+    for suffix, prefixes in _TRUSTED_NETS.items():
+        if h == suffix or h.endswith('.' + suffix):
+            return not any(ip.startswith(p) for p in prefixes)
+    return False
+
+
+def _candidates(name):
+    """收集各备份 DNS 返回的全部候选 A 记录 (去重, 过滤污染段)."""
+    out = []
+    for srv in FALLBACK_DNS:
+        ip = _query_dns(srv, name)
+        if ip and ip not in out and not _ip_suspicious(name, ip):
+            out.append(ip)
+    return out
+
+
+def _tls_ok(ip, host, timeout=4.0):
+    """TLS 握手是否成功 (仅 TCP 可连不够!).
+
+    实测 (2026-11-22): GitHub 的部分 A 记录 (20.6.7.17 / 20.205.243.166)
+    TCP 能连上, 但 TLS 握手超时 -> 客户端表现为 "Empty reply from server".
+    因此解析结果必须过 TLS 校验, 否则照样连不通.
+    """
+    import ssl
+    try:
+        raw = socket.create_connection((ip, 443), timeout=timeout)
+    except Exception:
+        return False
+    try:
+        ctx = ssl.create_default_context()
+        ss = ctx.wrap_socket(raw, server_hostname=host)
+        ss.close()
+        return True
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        return False
+
+
+def resolve_verified(name):
+    """返回经 TLS 握手验证的 IP; 无可用则返回 None.
+
+    背景: 部分站点会返回"TCP 可连但 TLS 握手超时"的死 IP
+    (实测 GitHub 20.6.7.17 / 20.205.243.166). 只做 DNS 解析不够, 必须握手验证.
+    """
+    now = _now()
+    with _lock:
+        hit = _cache.get(name)
+        if hit and hit[1] > now:
+            return hit[0]
+    cands = _candidates(name)
+    for ip in cands:
+        if _tls_ok(ip, name):
+            with _lock:
+                _cache[name] = (ip, _now() + TTL_SEC)
+            return ip
+    if not cands:
+        # 候选全被污染过滤 => 放宽后取原始结果, 仍做 TLS 校验
+        for srv in FALLBACK_DNS:
+            ip = _query_dns(srv, name)
+            if ip:
+                cands.append(ip)
+                break
+        for ip in cands:
+            if _tls_ok(ip, name):
+                with _lock:
+                    _cache[name] = (ip, _now() + TTL_SEC)
+                return ip
+    if cands:
+        # 没有一个通过 TLS 校验 (可能站点确实要求代理/客户端证书) ->
+        # 仍返回首个候选, 让上层自己报错, 不要静默失败.
+        with _lock:
+            _cache[name] = (cands[0], _now() + TTL_SEC)
+        return cands[0]
+    return None
+
+
 def resolve_fallback(name):
-    """系统解析失败时的兜底解析; 依次尝试备份 DNS, 返回 IP 或 None."""
+    """系统解析失败时的兜底解析; 依次尝试备份 DNS, 返回 IP 或 None.
+
+    对 https 类域名会做 TLS 握手校验, 跳过"TCP 可连但握手超时"的死 IP.
+    """
     if not name:
         return None
     if isinstance(name, bytes):
@@ -114,13 +229,11 @@ def resolve_fallback(name):
         hit = _cache.get(name)
         if hit and hit[1] > now:
             return hit[0]
-    for srv in FALLBACK_DNS:
-        ip = _query_dns(srv, name)
-        if ip:
-            with _lock:
-                _cache[name] = (ip, _now() + TTL_SEC)
-            return ip
-    return None
+    ip = resolve_verified(name)
+    if ip:
+        with _lock:
+            _cache[name] = (ip, _now() + TTL_SEC)
+    return ip
 
 
 def _now():
