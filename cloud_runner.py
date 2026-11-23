@@ -197,12 +197,14 @@ def safe_name(name, fallback='media'):
     return (name or fallback)[:120]
 
 
-def _heartbeat(tid, stop_evt):
+def _heartbeat(tid, stop_evt, claim_token=''):
     """② 下载期间每 60s 上报一次, 刷新 Worker 租约, 防止被卡死回收误杀.
-    只带 phase 文字续租, 不伪造百分比(真实进度属另一议题). 失败静默, 不打断下载."""
+    只带 phase 文字续租, 不伪造百分比(真实进度属另一议题). 失败静默, 不打断下载.
+    claim_token: ③ 领取令牌, 供 Worker 拒绝过期实例回写."""
     while not stop_evt.wait(60):
         try:
-            api('POST', '/progress', {'id': tid, 'phase': '云端下载中…'})
+            api('POST', '/progress', {'id': tid, 'phase': '云端下载中…',
+                                      'claim_token': claim_token})
         except Exception:
             pass
 
@@ -254,11 +256,13 @@ def process(task, release_id):
     outdir = os.path.join(HERE, '_tmp', tid)
     os.makedirs(outdir, exist_ok=True)
     stop_evt = threading.Event()
-    hb = threading.Thread(target=_heartbeat, args=(tid, stop_evt), daemon=True)
+    hb = threading.Thread(target=_heartbeat,
+                          args=(tid, stop_evt, task.get('claim_token', '')), daemon=True)
     try:
         print('领取任务 %s: %s [%s]' % (tid, task['url'], task.get('fmt')), flush=True)
         try:
-            api('POST', '/progress', {'id': tid, 'phase': '云端解析中…'})
+            api('POST', '/progress', {'id': tid, 'phase': '云端解析中…',
+                                      'claim_token': task.get('claim_token', '')})
         except Exception:
             pass
         hb.start()  # ② 下载期间续租, 防大文件被卡死回收误杀
@@ -281,12 +285,13 @@ def process(task, release_id):
         public = gh_upload(release_id, local, fname)
         api('POST', '/finish', {'id': tid, 'ok': True, 'path': public,
                                 'size': size, 'secs': round(time.time() - t0, 1),
-                                'warn': warn})
+                                'warn': warn, 'claim_token': task.get('claim_token', '')})
         print('  完成 -> %s' % public, flush=True)
     except Exception as e:
         print('  任务 %s 失败: %s' % (tid, e), flush=True)
         try:
-            api('POST', '/finish', {'id': tid, 'ok': False, 'err': str(e)[:500]})
+            api('POST', '/finish', {'id': tid, 'ok': False, 'err': str(e)[:500],
+                                    'claim_token': task.get('claim_token', '')})
         except Exception as e2:
             print('  回写失败状态也失败: %s' % e2, flush=True)
     finally:
