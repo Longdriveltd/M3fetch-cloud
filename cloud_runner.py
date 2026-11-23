@@ -160,6 +160,10 @@ def process_deletes(release_id):
     items = d.get('items') or []
     done = 0
     for it in items:
+        # KV 写配额保护: 云端已确认的项不再每轮重复删/回写. 本机 agent 侧同样跳过
+        # local_done 项. 双确认未齐时双方各自只写一次, 不再空转烧配额.
+        if it.get('cloud_done') is True:
+            continue
         jid = str(it.get('id') or '')
         raw_path = it.get('path') or ''
         name = asset_name_from_path(raw_path)
