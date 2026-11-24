@@ -300,20 +300,41 @@ def is_direct_media(url):
 
 
 def is_image(url):
-    path = urllib.parse.urlparse(url).path.lower()
+    o = urllib.parse.urlparse(url)
+    path = o.path.lower()
     if path.endswith(IMG_EXT):
         return True
-    # 视频号封面是 CDN 直链, 无扩展名, 但路径段 20304 + 图片格式参数 => 实为图片.
-    # (视频流走 20302/20303, 不含 picformat, 不会被误判)
-    q = urllib.parse.urlparse(url).query.lower()
-    return ('/20304/' in path and ('wxampicformat=' in q or 'picformat=' in q))
+    q = o.query.lower()
+    if '/20304/' in path and ('wxampicformat=' in q or 'picformat=' in q):
+        return True
+    # 嵌套直链: nimg.ws.126.net/?url=http%3A%2F%2F...jpg 之类, 路径无扩展名,
+    # 真实图片地址藏在 query 参数里. 不识别会把图片当 mp4 下载/上传/播放.
+    try:
+        for vals in urllib.parse.parse_qs(q, keep_blank_values=True).values():
+            for s in vals:
+                if urllib.parse.urlparse(urllib.parse.unquote(s)).path.lower().endswith(IMG_EXT):
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def img_ext(url):
-    path = urllib.parse.urlparse(url).path.lower()
+    o = urllib.parse.urlparse(url)
+    path = o.path.lower()
     for e in IMG_EXT:
         if path.endswith(e):
             return e
+    # 嵌套直链的真实扩展在 query 参数里 (配合 is_image)
+    try:
+        for vals in urllib.parse.parse_qs(o.query, keep_blank_values=True).values():
+            for s in vals:
+                pp = urllib.parse.urlparse(urllib.parse.unquote(s)).path.lower()
+                for e in IMG_EXT:
+                    if pp.endswith(e):
+                        return e
+    except Exception:
+        pass
     return '.jpg'
 
 
@@ -723,23 +744,38 @@ def _wx_post_json(api, body, timeout, headers=None):
 def resolve_weixin_channels(url, timeout=20, extra_headers=None):
     """解析微信视频号 sph 链接 -> (medias, note).
 
-    匿名: 返回封面图直链 (picInfo 为空时用 coverUrl) + 文案, 并在 note 里说明
-    视频流需元宝 Cookie. 有 Cookie: 走 yuanbao 换 token/exportId, 再取视频直链.
+    已验证的正确链路 (2026-11-22 实测):
+      1) 规范化 URL: <任意 sph 链接> -> https://channels.weixin.qq.com/finder-preview/pages/sph?id=<shortUri>
+         (直接把 weixin.qq.com/sph/<id> 喂给元宝会返回空 wx_export_id, 必须先规范化)
+      2) 元宝 get_parse_result (带元宝 Cookie) -> wx_export_id + playable_url
+         playable_url 的 query 里带 token(generalToken) 与 eid(exportId)
+      3) get_feed_info {baseReq:{generalToken:token}, exportId:eid}
+         -> feedInfo.h264VideoInfo.videoUrl = finder.video.qq.com/.../stodownload (真视频直链)
+      4) feedInfo.coverUrl 是**封面 JPG**, 不是视频 —— 不能当视频返回(会造成假成功)
+
+    匿名(无元宝 Cookie): 只能拿到 元数据 + 封面, 明确告知缺什么, 由上层写进任务错误.
     """
     sid = weixin_sph_id(url)
     if not sid:
         return [], '不是视频号链接'
+    # 关键: 规范化成 finder-preview 页面 URL —— 元宝只认这个形式
+    canonical = 'https://channels.weixin.qq.com/finder-preview/pages/sph?id=%s' % sid
+
+    # 匿名先拿元数据 (作者/文案/封面), 供 title 与失败提示用
+    fi = {}
+    author = desc = ''
     try:
         d = _wx_post_json(WX_FEED_INFO_API,
                            {'baseReq': {'generalToken': ''}, 'shortUri': sid},
                            timeout)
+        data = d.get('data') or {}
+        fi = data.get('feedInfo') or {}
+        author = (data.get('authorInfo') or {}).get('nickname') or ''
+        desc = fi.get('description') or ''
     except Exception as e:
-        return [], '视频号接口失败: %s' % str(e)[:120]
-    data = d.get('data') or {}
-    fi = data.get('feedInfo') or {}
-    author = (data.get('authorInfo') or {}).get('nickname') or ''
-    desc = fi.get('description') or ''
-    scene = data.get('sceneInfo') or {}
+        meta_err = '视频号元数据接口失败: %s' % str(e)[:120]
+    else:
+        meta_err = ''
     title = (desc or '视频号视频')[:60]
     if author:
         title = '%s-%s' % (author, title)
@@ -753,32 +789,45 @@ def resolve_weixin_channels(url, timeout=20, extra_headers=None):
         try:
             yb = _wx_post_json(
                 WX_YUANBAO_API,
-                {'type': 'video_channel_url', 'url': url, 'scene': 1},
+                {'type': 'video_channel_url', 'url': canonical, 'scene': 1},
                 timeout,
                 {'Cookie': cookie, 'Origin': 'https://yuanbao.tencent.com',
                  'Referer': 'https://yuanbao.tencent.com/'})
-            export_id = (yb.get('wx_export_id') or yb.get('exportId') or '')
-            token = (yb.get('generalToken') or yb.get('token') or '')
-            playable = yb.get('playable_url') or ''
+            ydata = yb.get('data') or {}
+            export_id = (ydata.get('wx_export_id') or ydata.get('exportId') or '')
+            token = (ydata.get('generalToken') or ydata.get('token') or '')
+            playable = ydata.get('playable_url') or ''
             if playable:
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(playable).query)
+                # 关键: playable_url 里的 eid 才是 get_feed_info 认的 exportId;
+                # wx_export_id 是另一个 id, 用它取不到媒体(实测)。
+                playable_eid = (q.get('eid') or q.get('exportId') or [''])[0]
                 token = token or (q.get('token') or [''])[0]
-                export_id = export_id or (q.get('eid') or q.get('exportId') or [''])[0]
-            if export_id:
-                d2 = _wx_post_json(
-                    WX_FEED_INFO_API,
-                    {'baseReq': {'generalToken': token}, 'exportId': export_id},
-                    timeout)
-                meds = _wx_media_from_feed(d2, title, extra_headers)
-                if meds:
-                    return meds, '视频号(元宝 token) 命中 %d 项' % len(meds)
+                if playable_eid:
+                    export_id = playable_eid
+            if not export_id:
+                return [], ('元宝未返回 exportId (链接形式可能不被接受) | 元数据: 作者=%s 文案=%s'
+                            % (author[:20], desc[:40]))
+            d2 = _wx_post_json(
+                WX_FEED_INFO_API,
+                {'baseReq': {'generalToken': token}, 'exportId': export_id},
+                timeout, {'Cookie': cookie})
+            meds = _wx_media_from_feed(d2, title, extra_headers)
+            if meds:
+                note = '视频号(元宝 token) 命中 %d 项 | 作者=%s' % (len(meds), author[:20])
+                return meds, note
+            # 有 exportId 但没解析出媒体 -> 可能是内容受限
+            return [], ('元宝链路通但未取到媒体(内容可能受限) | exportId=%s | 作者=%s'
+                        % (export_id[:40], author[:20]))
         except Exception as e:
             return [], '视频号取流失败(元宝链路): %s' % str(e)[:120]
 
     # 匿名兜底: 只拿到元数据 + 封面. 不把封面当"视频"返回 —— 那会让任务假成功
     # (落盘一个 jpg 却报下载完成). 明确告知缺什么, 由上层把错误写进任务状态.
     cover = fi.get('coverUrl') or ''
-    note = '视频号视频流匿名不可得(需腾讯元宝 Cookie 换 generalToken)'
+    note = '视频号视频流需腾讯元宝 Cookie 换 generalToken (匿名不可得)'
+    if meta_err:
+        note = meta_err
     if desc:
         note += ' | 文案: %s' % desc[:60]
     if author:
@@ -789,18 +838,36 @@ def resolve_weixin_channels(url, timeout=20, extra_headers=None):
 
 
 def _wx_media_from_feed(feed, title, extra_headers):
-    """从带媒体的 get_feed_info 响应里提取视频/图片直链."""
+    """从带媒体的 get_feed_info 响应里提取视频/图片直链.
+
+    注意 (2026-11-22 实测): 视频号视频直链形如
+      https://finder.video.qq.com/251/20302/stodownload?encfilekey=...&token=...
+    **不带 .mp4 后缀**, 所以不能只靠扩展名判断; 认准 finder.video.qq.com 域.
+    封面 coverUrl 走 finder.video.qq.com/251/20304/stodownload (20304=封面, 20302=视频),
+    两者域相同, 靠路径段区分.
+    """
     out = []
     fi = (feed.get('data') or {}).get('feedInfo') or {}
+
+    def is_video(u):
+        if not isinstance(u, str) or not u.startswith('http'):
+            return False
+        if '.mp4' in u or '.m3u8' in u:
+            return True
+        # finder.video.qq.com 的 stodownload: 20302/20303 段是视频, 20304 是封面
+        if 'finder.video.qq.com' in u and '/20304/' not in u:
+            return True
+        return False
 
     def walk(node):
         if isinstance(node, dict):
             for k, v in node.items():
                 kl = str(k).lower()
                 if isinstance(v, str) and v.startswith('http'):
-                    if '.mp4' in v or '.m3u8' in v:
+                    if is_video(v):
                         out.append(v)
-                elif kl in ('url', 'urlinfo', 'videourl', 'mediainfo'):
+                elif kl in ('url', 'urlinfo', 'videourl', 'mediainfo', 'videoinfo',
+                            'h264videoinfo', 'h265videoinfo', 'media', 'medialist'):
                     walk(v)
                 else:
                     walk(v)
@@ -811,10 +878,20 @@ def _wx_media_from_feed(feed, title, extra_headers):
     walk(fi)
     seen, medias = set(), []
     for u in out:
-        if u in seen:
+        # 去重按 encfilekey (文件标识): 同一文件每次请求 token 不同, 整条 URL 比对会漏.
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+            ident = (qs.get('encfilekey') or [u])[0]
+        except Exception:
+            ident = u
+        if ident in seen:
             continue
-        seen.add(u)
-        medias.append({'title': title, 'url': u, 'headers': norm_headers(extra_headers),
+        seen.add(ident)
+        mh = norm_headers(extra_headers)
+        # finder.video.qq.com 的 stodownload 需要来源页 Referer, 否则 403
+        mh.setdefault('Referer', 'https://channels.weixin.qq.com/')
+        mh.setdefault('User-Agent', WX_UA)
+        medias.append({'title': title, 'url': u, 'headers': mh,
                        'channel': '视频号', 'via': 'weixin-channels'})
     return medias
 
@@ -1144,6 +1221,46 @@ def _write_progress(path, pct, extra=None):
         pass
 
 
+def direct_download(media, out, timeout=60, on_bytes=None):
+    """单连接直链下载 (Python urllib, 强制无代理).
+
+    为什么需要: ffmpeg 子进程不继承 Python 的 DNS 兜底补丁, 且会读系统代理环境变量,
+    对 finder.video.qq.com / 视频号 CDN 会 502 或 DNS 解析失败. 本函数走 Python
+    自己的 socket(dnsfix 已 patch) + 无代理 opener, 实测可用.
+    返回 (ok, note).
+    """
+    url = media.get('url', '')
+    if not url_ok(url):
+        return False, 'URL 不合法'
+    hdr = {'User-Agent': UA}
+    hdr.update(norm_headers(media.get('headers')))
+    tmp = out + '.dlpart'
+    try:
+        req = urllib.request.Request(url, headers=hdr)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            with open(tmp, 'wb') as f:
+                while True:
+                    buf = r.read(262144)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    if on_bytes:
+                        on_bytes(f.tell())
+        if os.path.getsize(tmp) < 1024:
+            raise IOError('下载内容过小')
+        if os.path.exists(out):
+            os.remove(out)
+        os.replace(tmp, out)
+        return True, '%.1f MiB' % (os.path.getsize(out) / 1024 / 1024)
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False, '直连下载失败: %s' % str(e)[:120]
+
+
 def ffmpeg_cmd(ffmpeg, media, out, fmt, duration, overwrite, insecure, audio_fallback=False):
     headers = {'User-Agent': UA}
     headers.update(norm_headers(media.get('headers')))
@@ -1201,15 +1318,22 @@ def _run_ffmpeg(cmd, limit, quiet, on_pct=None, total_sec=None, total_bytes=None
       轮询输出文件大小作为连续进度来源 (真实字节/总字节).
     都无则不采集. 返回 returncode; 超时抛 TimeoutExpired."""
     known = (total_sec and total_sec > 0) or (total_bytes and total_bytes > 0)
+    # ffmpeg 会读 http_proxy/https_proxy 环境变量 —— 系统代理(127.0.0.1:55451)对
+    # finder.video.qq.com 等目标返 502/TLS 中断. 必须清掉, 强制直连.
+    fenv = dict(os.environ)
+    for k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY'):
+        fenv.pop(k, None)
+    fenv['no_proxy'] = '*'
     if not known and not on_bytes:
-        p = subprocess.run(cmd, capture_output=quiet, timeout=limit, creationflags=NO_WINDOW)
+        p = subprocess.run(cmd, capture_output=quiet, timeout=limit, env=fenv,
+                           creationflags=NO_WINDOW)
         return p.returncode
     # -progress pipe:1 输出 key=value; -nostats 关掉 stderr 的统计行避免重复
     pcmd = list(cmd)
     pcmd[1:1] = ['-progress', 'pipe:1', '-nostats']
     proc = subprocess.Popen(pcmd, stdout=subprocess.PIPE,
                             stderr=(subprocess.DEVNULL if quiet else None),
-                            creationflags=NO_WINDOW)
+                            env=fenv, creationflags=NO_WINDOW)
     state = {'pct': 0}
 
     def push(pct):
@@ -1362,6 +1486,25 @@ def download(ffmpeg, media, outdir, fmt, duration, overwrite, insecure, label,
                 mp_ok = False
             if not quiet:
                 print('[分段] 不可用/失败, 回退 ffmpeg 单连接')
+    # 单连接直连下载: ffmpeg 子进程**不继承** Python 的 dnsfix 补丁, 且会读系统代理
+    # (http_proxy) —— 对 finder.video.qq.com 等目标会 502 / DNS 解析失败.
+    # 所以先走 Python 自己下载(有 DNS 兜底 + 强制直连), 成功就不用 ffmpeg.
+    url_l2 = str(media.get('url', '')).lower().split('?')[0]
+    if fmt == 'mp4' and '.m3u8' not in url_l2 and url_ok(media.get('url', '')):
+        if not quiet:
+            print('[直连] %s (Python 单连接, 绕过 ffmpeg 的 DNS/代理问题)' % media['title'])
+        ok2, note2 = direct_download(media, out, timeout=timeout or 60,
+                                     on_bytes=on_bytes)
+        if ok2:
+            good, note = verify_output(out, fmt)
+            if good:
+                if on_pct:
+                    on_pct(100)
+                return True, out, '直连下载 (%s)' % note
+            try:
+                os.remove(out)
+            except OSError:
+                pass
     cmd = ffmpeg_cmd(ffmpeg, media, out, fmt, duration, overwrite, insecure)
     if not quiet:
         print('\n[下载] %s -> %s' % (media['title'], out))
@@ -1640,6 +1783,10 @@ def main():
     extra = {}
     for h in a.header:
         extra.update(norm_headers(h))
+    # 凭据走环境变量 (不走命令行: argv 会进日志/进程列表)
+    env_cookie = os.environ.get('VFETCH_COOKIE', '').strip()
+    if env_cookie:
+        extra['Cookie'] = env_cookie
 
     medias, report = resolve(url, timeout=a.timeout,
                              use_ytdlp=not a.no_ytdlp, extra_headers=extra)
