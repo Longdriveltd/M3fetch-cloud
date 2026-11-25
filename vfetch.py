@@ -86,8 +86,8 @@ MOBILE_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) '
              'Mobile/15E148 Safari/604.1')
 MEDIA_EXT = ('.m3u8', '.mp4', '.mkv', '.ts', '.mp3', '.flv', '.mov', '.webm', '.m4a')
 IMG_EXT = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
-STRATEGY_NAMES = ['1 直链判断', '2 手机端详情 API', '3 网页嗅探',
-                  '4 微信视频号 API', '5 微博视频页 API', '6 yt-dlp 兜底']
+STRATEGY_NAMES = ['1 直链判断', '2 网易云歌曲', '3 手机端详情 API', '4 网页嗅探',
+                  '5 微信视频号 API', '6 微博视频页 API', '7 yt-dlp 兜底']
 ALLOWED_SCHEMES = ('http', 'https')
 MAX_HTTP_BYTES = 8 * 1024 * 1024
 MAX_IMG_BYTES = 50 * 1024 * 1024
@@ -346,6 +346,9 @@ def media_title(u):
 
 def guess_fmt(media):
     """-f auto: 解析出真实媒体地址后, 按地址推断落盘格式 (短链/播放页无法从 URL 判断)."""
+    if media.get('via') == 'yt-dlp搜源':
+        # 搜源拿到的是纯音频流(googlevideo 无扩展名/容器混杂), 统一转 mp3 最稳
+        return 'mp3'
     u = str((media or {}).get('url') or '')
     if is_image(u):
         return img_ext(u).lstrip('.')
@@ -626,24 +629,23 @@ def resolve_ytdlp(url, timeout, extra_cands=None):
         import yt_dlp
     except ImportError:
         return [], 'yt-dlp 未安装 (可选依赖)'
-    opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
-            'noplaylist': True, 'socket_timeout': timeout,
-            # 禁用代理: yt-dlp 默认读 HTTP_PROXY/HTTPS_PROXY, 本机代理对目标站
-            # 502/TLS 中断, 表现为 "SSL: UNEXPECTED_EOF_WHILE_READING".
-            # 'proxy': '' 表示不走任何代理 (直连).
-            'proxy': ''}
     cands = list(dict.fromkeys([url] + list(extra_cands or [])))
     info = None
     last_err = ''
     for cand in cands:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(cand, download=False)
-            if info:
-                break
-        except Exception as e:
-            last_err = str(e)[:120]
-            info = None
+        for proxy in YTDLP_PROXY_CANDS:
+            opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+                    'noplaylist': True, 'socket_timeout': timeout, 'proxy': proxy}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(cand, download=False)
+                if info:
+                    break
+            except Exception as e:
+                last_err = str(e)[:120]
+                info = None
+        if info:
+            break
     if not info:
         return [], 'yt-dlp 提取失败 (试了 %d 个地址): %s' % (len(cands), last_err)
     if not info:
@@ -896,6 +898,168 @@ def _wx_media_from_feed(feed, title, extra_headers):
     return medias
 
 
+NETEASE_SONG_RE = re.compile(r'music\.163\.com/(?:#/)?song\?id=(\d+)', re.I)
+# yt-dlp 代理候选: 本机 v2rayN socks -> 本机 http -> 直连(云端/GH Actions 出口在墙外)
+YTDLP_PROXY_CANDS = ('socks5h://127.0.0.1:10808', 'http://127.0.0.1:10809', '')
+
+
+def _netease_api(path, params, timeout):
+    q = urllib.parse.urlencode(params)
+    req = urllib.request.Request('https://music.163.com/api/' + path + '?' + q, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer': 'https://music.163.com/'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8', 'replace'))
+
+
+def _ytdlp_extract(url, timeout):
+    """yt-dlp 解析, 依次尝试代理候选(本机走 socks, 云端直连). 返回 (info, 末次错误)."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return None, 'yt-dlp 未安装 (可选依赖)'
+    last = ''
+    for proxy in YTDLP_PROXY_CANDS:
+        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+                'noplaylist': True, 'socket_timeout': timeout, 'proxy': proxy}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info:
+                return info, ''
+        except Exception as e:
+            last = str(e)[:100]
+    return None, last
+
+
+def _netease_via_ytdlp(query, dur_ms, note, timeout):
+    """VIP/试听曲目兜底: yt-dlp 全网搜源, 选时长最接近官方版本的音频."""
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        return [], note + ' | VIP曲目且yt-dlp未安装'
+    entries, err = _ytdlp_extract('ytsearch6:' + query, timeout)
+    if not entries:
+        return [], note + ' | VIP曲目搜源失败(%s)' % err[:60]
+    if isinstance(entries, dict):
+        entries = entries.get('entries') or []
+    entries = [e for e in (entries or []) if isinstance(e, dict)]
+    if not entries:
+        return [], note + ' | VIP曲目搜源无结果'
+    want = (dur_ms or 0) / 1000.0
+    bad = ('翻唱', 'cover', '伴奏', 'live', 'remix', '演奏', 'piano', '铃声')
+    scored = []
+    for e in entries:
+        t = (e.get('title') or '').lower()
+        d = float(e.get('duration') or 0)
+        if not d:
+            continue
+        penalty = 60.0 if any(b in t for b in bad) else 0.0
+        if want and abs(d - want) > want * 0.5:
+            penalty += 120.0   # 时长差太多的大概率不是这首歌
+        scored.append((abs(d - want) + penalty, e, d))
+    scored.sort(key=lambda x: x[0])
+    for _, e, d in scored[:3]:
+        vid = e.get('id') or ''
+        info, err = _ytdlp_extract(e.get('url') or
+                                   ('https://www.youtube.com/watch?v=' + vid), timeout)
+        if not info:
+            continue
+        auds = [f for f in (info.get('formats') or [])
+                if f.get('acodec') not in (None, 'none') and f.get('url')]
+        auds.sort(key=lambda f: -(f.get('abr') or 0))
+        if auds:
+            f = auds[0]
+            title = info.get('title') or e.get('title') or query
+            watch = info.get('webpage_url') or ('https://www.youtube.com/watch?v=' + vid)
+            return [{'title': title, 'url': f['url'], '_watch': watch,
+                     'headers': {'User-Agent': 'Mozilla/5.0'},
+                     'channel': '网易云', 'via': 'yt-dlp搜源'}], \
+                note + ' | VIP曲目->全网搜源 %.0fs (官方 %.0fs)' % (d, want)
+    return [], note + ' | VIP曲目搜源无可播音频'
+
+
+def _download_via_ytdlp(media, out, ffmpeg, timeout=300, on_bytes=None):
+    """搜源音频: yt-dlp 自带下载器拉流(带代理/签名处理), 再 ffmpeg 转 mp3."""
+    import tempfile
+    try:
+        import yt_dlp
+    except ImportError:
+        return False, out, 'yt-dlp 未安装'
+    src = media.get('_watch') or media.get('url')
+    d = os.path.dirname(os.path.abspath(out))
+    prefix = os.path.join(d, '_ytdlp_%d' % int(time.time() * 1000))
+    err = ''
+    for proxy in YTDLP_PROXY_CANDS:
+        try:
+            opts = {'quiet': True, 'no_warnings': True, 'socket_timeout': timeout,
+                    'proxy': proxy, 'format': 'bestaudio/best',
+                    'outtmpl': prefix + '.%(ext)s'}
+            if on_bytes:
+                def _hook(dd, _ob=on_bytes):
+                    if dd.get('status') == 'downloading':
+                        try:
+                            _ob(int(dd.get('downloaded_bytes') or 0))
+                        except Exception:
+                            pass
+                opts['progress_hooks'] = [_hook]
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(src, download=True)
+            files = [f for f in os.listdir(d) if f.startswith(os.path.basename(prefix))]
+            if not files:
+                err = 'yt-dlp 下载无产物'
+                continue
+            srcf = os.path.join(d, files[0])
+            cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-i', srcf,
+                   '-vn', '-codec:a', 'libmp3lame', '-b:a', '192k', out]
+            rc = subprocess.run(cmd, capture_output=True).returncode
+            try:
+                os.remove(srcf)
+            except OSError:
+                pass
+            if rc == 0 and os.path.isfile(out) and os.path.getsize(out) > 10000:
+                return True, out, 'yt-dlp搜源下载+转mp3 (%s)' % (proxy or '直连')
+            return False, out, 'ffmpeg 转码 rc=%d' % rc
+        except Exception as e:
+            err = str(e)[:140]
+    return False, out, 'yt-dlp搜源下载失败: %s' % err
+
+
+def netease_song_medias(url, timeout):
+    """网易云单曲: API 拿真实时长/全量直链; VIP 试听曲目(30s)自动转 yt-dlp 全网搜源.
+    返回 (medias, note). medias 空 = 未命中或失败(交后续策略)."""
+    m = NETEASE_SONG_RE.search(url)
+    if not m:
+        return [], ''
+    sid = m.group(1)
+    try:
+        d = _netease_api('song/detail', {'ids': '[%s]' % sid, 'id': sid}, timeout)
+        song = (d.get('songs') or [{}])[0]
+        title = song.get('name') or ('网易云%s' % sid)
+        artists = ' '.join(a.get('name', '') for a in song.get('artists') or [])
+        dur_ms = int(song.get('duration') or 0)
+        fee = song.get('fee')
+        note = '%s - %s (fee=%s, %ds)' % (artists or '?', title, fee, dur_ms // 1000)
+    except Exception as e:
+        return [], '详情API失败: %s' % str(e)[:80]
+    full_url = None
+    try:
+        p = _netease_api('song/enhance/player/url',
+                         {'ids': '[%s]' % sid, 'br': 320000}, timeout)
+        it = (p.get('data') or [{}])[0]
+        u = it.get('url') or ''
+        if u and not it.get('freeTrialInfo'):
+            full_url = u
+    except Exception:
+        pass
+    if full_url:
+        return [{'title': ('%s %s' % (artists, title)).strip(), 'url': full_url,
+                 'headers': {'Referer': 'https://music.163.com/'},
+                 'channel': '网易云', 'via': 'netease'}], note + ' | 免费全量直链'
+    query = ('%s %s' % (artists, title)).strip()
+    return _netease_via_ytdlp(query, dur_ms, note, timeout)
+
+
 def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
     """返回 (medias, report). report 条数 == STRATEGY_NAMES -> 分母强制."""
     report = [{'name': n, 'count': 0, 'note': ''} for n in STRATEGY_NAMES]
@@ -920,7 +1084,17 @@ def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
         return medias, report
     report[0]['note'] = 'URL 不是媒体直链'
 
-    # 抓页面一次, 供策略 2 / 3 复用. 短链/微博用移动 UA, 否则会被踢到 passport 访客页
+    # 策略 2: 网易云歌曲 (免费歌走 API 全量直链; VIP/试听曲目转 yt-dlp 全网搜源)
+    nm, nnote = netease_song_medias(url, timeout)
+    report[1]['count'] = len(nm)
+    report[1]['note'] = nnote or '不是网易云歌曲链接'
+    if nm:
+        medias.extend(nm)
+        for r in report[2:]:
+            r['note'] = '策略 2 已命中, 未执行'
+        return medias, report
+
+    # 抓页面一次, 供策略 3 / 4 复用. 短链/微博用移动 UA, 否则会被踢到 passport 访客页
     page_text, final_url = '', url
     try:
         page_text, final_url, _ = http_get(url, timeout=timeout, ua=ua_for(url))
@@ -932,35 +1106,35 @@ def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
             if real and url_ok(real):
                 page_text, final_url, _ = http_get(real, timeout=timeout, ua=MOBILE_UA)
     except Exception as e:
-        report[1]['note'] = '页面抓取失败: %s' % str(e)[:100]
-        report[2]['note'] = '无页面内容可扫'
+        report[2]['note'] = '页面抓取失败: %s' % str(e)[:100]
+        report[3]['note'] = '无页面内容可扫'
     else:
-        # 策略 2: 手机端 App 页面
+        # 策略 3: 手机端 App 页面
         is_app = any(k in page_text for k in
                      ('/api/video/detail', 'videoPlaylist', 'video-detail.html'))
         if is_app:
             try:
                 m, note = resolve_local_app(final_url, timeout)
                 medias.extend(m)
-                report[1]['count'] = len(m)
-                report[1]['note'] = note
+                report[2]['count'] = len(m)
+                report[2]['note'] = note
             except Exception as e:
-                report[1]['note'] = '详情 API 失败: %s' % str(e)[:120]
+                report[2]['note'] = '详情 API 失败: %s' % str(e)[:120]
         else:
-            report[1]['note'] = '不是手机端播放页 (未匹配 /api/video/detail)'
+            report[2]['note'] = '不是手机端播放页 (未匹配 /api/video/detail)'
 
-        # 策略 3: 网页嗅探 (策略 2 未命中才扫)
+        # 策略 4: 网页嗅探 (策略 3 未命中才扫)
         if not medias:
             found = extract_m3u8(page_text, final_url)
             for u in found:
                 medias.append({'title': media_title(u), 'url': u,
                                'headers': dict(extra), 'channel': '网页', 'via': 'sniff'})
-            report[2]['count'] = len(found)
-            report[2]['note'] = '扫描 %d 字符 HTML, 命中 %d 个 m3u8' % (len(page_text), len(found))
+            report[3]['count'] = len(found)
+            report[3]['note'] = '扫描 %d 字符 HTML, 命中 %d 个 m3u8' % (len(page_text), len(found))
         else:
-            report[2]['note'] = '策略 2 已命中, 未执行'
+            report[3]['note'] = '策略 3 已命中, 未执行'
 
-    # 策略 4: 微信视频号 API (sph 分享页是纯 JS 空壳, 嗅探扫不到)
+    # 策略 5: 微信视频号 API (sph 分享页是纯 JS 空壳, 嗅探扫不到)
     if not medias:
         if weixin_sph_id(url) or weixin_sph_id(final_url):
             try:
@@ -968,14 +1142,14 @@ def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
             except Exception as e:
                 m, note = [], '视频号 API 失败: %s' % str(e)[:120]
             medias.extend(m)
-            report[3]['count'] = len(m)
-            report[3]['note'] = note
+            report[4]['count'] = len(m)
+            report[4]['note'] = note
         else:
-            report[3]['note'] = '不是视频号链接'
+            report[4]['note'] = '不是视频号链接'
     else:
-        report[3]['note'] = '前面策略已命中, 未执行'
+        report[4]['note'] = '前面策略已命中, 未执行'
 
-    # 策略 5: 微博视频页 API (h5 播放页是 JS 空壳, 嗅探扫不到, 必须走组件 API)
+    # 策略 6: 微博视频页 API (h5 播放页是 JS 空壳, 嗅探扫不到, 必须走组件 API)
     if not medias:
         tried = []
         note = ''
@@ -990,26 +1164,26 @@ def resolve(url, timeout=15, use_ytdlp=True, extra_headers=None):
             if m:
                 medias.extend(m)
                 break
-        report[4]['count'] = len(medias)
+        report[5]['count'] = len(medias)
         if tried:
-            report[4]['note'] = note + ' (试了 %d 个地址)' % len(tried)
+            report[5]['note'] = note + ' (试了 %d 个地址)' % len(tried)
         else:
-            report[4]['note'] = '不是微博视频页 (无 oid)'
+            report[5]['note'] = '不是微博视频页 (无 oid)'
     else:
-        report[4]['note'] = '前面策略已命中, 未执行'
+        report[5]['note'] = '前面策略已命中, 未执行'
 
-    # 策略 6: yt-dlp 兜底 (先解短链/中间页, 再逐个候选尝试)
+    # 策略 7: yt-dlp 兜底 (先解短链/中间页, 再逐个候选尝试)
     if not medias:
         if use_ytdlp:
             cands = unwrap_candidates(url, timeout)
             m, note = resolve_ytdlp(url, timeout, extra_cands=cands)
             medias.extend(m)
-            report[5]['count'] = len(m)
-            report[5]['note'] = note + (' | 解包候选 %d 个' % len(cands) if len(cands) > 1 else '')
+            report[6]['count'] = len(m)
+            report[6]['note'] = note + (' | 解包候选 %d 个' % len(cands) if len(cands) > 1 else '')
         else:
-            report[5]['note'] = '已用 --no-ytdlp 关闭'
+            report[6]['note'] = '已用 --no-ytdlp 关闭'
     else:
-        report[5]['note'] = '前面策略已命中, 未执行'
+        report[6]['note'] = '前面策略已命中, 未执行'
 
     for m in medias:
         h = norm_headers(m.get('headers'))
@@ -1438,6 +1612,19 @@ def download(ffmpeg, media, outdir, fmt, duration, overwrite, insecure, label,
         if on_pct:
             on_pct(100)
         return True, out, '图片 %d B' % len(data)
+    # 搜源音频: yt-dlp 下载器拉流(带代理/签名处理) + 本地转 mp3.
+    # ffmpeg 直连 googlevideo 会被墙/防盗链, 不能直接喂 URL.
+    if media.get('via') == 'yt-dlp搜源' and fmt == 'mp3':
+        ok2, _out2, note2 = _download_via_ytdlp(media, out, ffmpeg,
+                                                timeout=timeout or 300, on_bytes=on_bytes)
+        if ok2:
+            if on_pct:
+                on_pct(100)
+            if not quiet:
+                print('[搜源] %s -> %s (%s)' % (media['title'], os.path.basename(out), note2))
+            return ok2, _out2, note2
+        if not quiet:
+            print('[搜源] 失败: %s (回退常规流程)' % note2)
     # 速度: 已完成且校验通过的直接跳过, 不重启 ffmpeg
     if not overwrite and os.path.isfile(out):
         ok, note = verify_output(out, fmt)
